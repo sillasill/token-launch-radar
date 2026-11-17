@@ -96,6 +96,11 @@ tbody tr[data-selected="true"] { background: rgba(45, 212, 167, 0.09); }
 .badge.high::before { background: var(--red); }
 .badge.watch { color: var(--blue); border-color: rgba(110, 168, 254, 0.4); }
 .badge.watch::before { background: var(--blue); }
+.badge.farm { color: var(--accent); border-color: rgba(45, 212, 167, 0.4); }
+.badge.thin { color: var(--amber); border-color: rgba(245, 181, 68, 0.4); }
+.badge.thin::before { background: var(--amber); }
+.badge.skip { color: var(--red); border-color: rgba(242, 109, 95, 0.4); }
+.badge.skip::before { background: var(--red); }
 .model { margin-top: var(--s4); padding: var(--s5); display: grid; gap: var(--s3); }
 .formula { font-family: var(--font-num); font-size: 13px; line-height: 1.7; color: var(--muted); overflow-wrap: anywhere; background: var(--canvas); border: 1px solid var(--border); border-radius: var(--radius-control); padding: var(--s3) var(--s4); }
 .note { border-left: 3px solid var(--amber); padding-left: var(--s3); color: var(--muted); font-size: 13px; }
