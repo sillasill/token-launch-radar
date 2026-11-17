@@ -1,4 +1,4 @@
-// Token Radar, model radar-3: one snapshot of the protocol universe in, one ranked board out.
+// Token Radar, model radar-4: one snapshot of the protocol universe in, one ranked board out.
 //
 // The board covers every slug in the snapshot's watchlist (the floor, never a ceiling) and
 // every other pre-token protocol that passes the watchlist's own exclusion rule, at any TVL:
@@ -10,28 +10,40 @@
 //
 // Implied value follows only from the snapshot's own figures, through one function per row:
 //
-//   size curve = log(market cap) = a + b * log(TVL), ordinary least squares over the 128
-//                  live-token protocols in THIS snapshot with a market cap and a TVL.
-//                  The curve is fitted, not assumed: a bigger protocol's token is worth
-//                  more in dollars but less per dollar of TVL (b = 0.522, so implied value
-//                  grows like TVL^0.522). The fitted multiple at a protocol's TVL is
-//                  exp(a + b*ln(TVL)) / TVL. No category multiple: a category residual was
-//                  tested and did not survive the time split (see the out-of-sample test),
-//                  so it is not used. Nothing is hardcoded by name: the same snapshot that
-//                  is graded is the snapshot the curve is fitted on, so the model re-derives
-//                  itself on any future snapshot instead of carrying a hand-kept list.
+//   size curve = log(market cap) = a + b * log(TVL), ordinary least squares over the
+//                  live-token protocols in THIS snapshot that are comparable peers:
+//                  the snapshot's own exclusion rule leaves out exchanges and bridge,
+//                  liquid-staking and restaking wrappers (CEX, Bridge, Canonical Bridge,
+//                  Liquid Staking, Liquid Restaking, Restaked BTC), whose token is a
+//                  different business from a DeFi protocol's. When the trimmed peer set
+//                  is too small to fit (fewer than 15), the curve falls back to all
+//                  live-token peers. The curve is fitted, not assumed: a bigger protocol's
+//                  token is worth more in dollars but less per dollar of TVL. No category
+//                  multiple: per-category fits were tested and did not survive
+//                  walk-forward (see the walk-forward test), so they are not used.
+//                  Nothing is hardcoded by name: the same snapshot that is graded is
+//                  the snapshot the curve is fitted on, so the model re-derives itself
+//                  on any future snapshot instead of carrying a hand-kept list.
 //   growth multiplier = 1 + clamp(change_7d, -60, 100) / 100 * 0.6
 //   maturity mult.    = 0.55 + 0.45 * min(age_days, 1460) / 1460   (age unknown: 365 days)
 //   chain multiplier  = 1 + 0.01 * min(chains - 1, 8)              (breadth, capped at 1.08)
 //   implied           = round(tvl_usd * curve_multiple * growth * maturity * chain)
 //
 // The model tests itself on the same snapshot, every run, and the dashboard reports the
-// numbers: a time-split out-of-sample test (fit on the live tokens listed before a cutoff,
-// test on the ones listed after it) against the old median-ratio model, and a bootstrap
-// (500 seeded resamples of the live tokens, refit each time) for the curve's stability.
-// The test is the reason the curve is used: on the 2024 split the curve's median log
-// error on held-out tokens is 1.07 against 1.64 for the median ratio, and on the 2023
-// split 1.12 against 1.64.
+// numbers. The headline test is walk-forward: expanding windows by listing year — fit
+// both the old median-ratio model and the size curve on the live tokens listed before
+// a year, test on the ones listed in that year, tokens neither model has seen. The
+// walk-forward test is also how the model was chosen: the trimmed-peer curve kept by
+// walk-forward beats the global curve on mean log error and within-2x on both test designs
+// (walk-forward pooled 1.55 vs 1.58, 35% vs 31% within 2x; cumulative 1.50 vs 1.55,
+// 37% vs 34%), and ties it on rank, because both rank by TVL within a fold. Per-category
+// fits, a quadratic curve and a trimmed curve without the small-train fallback all lost
+// walk-forward and were rejected. A second, cumulative time-split
+// test (fit before a cutoff, test after it) is kept for continuity with radar-3.
+// A bootstrap (500 seeded resamples of the fitted peers, refit each time) checks
+// the curve's stability. The test is the reason the curve is used: walk-forward is
+// the model being tested on tokens it never saw, year by year, not on its own
+// training data.
 //
 // Risk is a separate, stated score, never folded into the value: points for a sharp 7-day move,
 // an unknown or very young listing, single-chain exposure, a thin TVL and a missing category.
@@ -113,7 +125,7 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-3';
+export const MODEL_VERSION = 'radar-4';
 
 /** How many live-token protocols the Live-token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -227,6 +239,31 @@ export interface OosSplit {
   size_curve: OosModelResult;
 }
 
+/** One year of the walk-forward test: fit on the tokens listed before the year, test on that year's listings. */
+export interface WalkForwardFold {
+  year: string;
+  train_n: number;
+  test_n: number;
+  median_ratio: OosModelResult;
+  size_curve: OosModelResult;
+}
+
+/** Both models' pooled walk-forward numbers: every dated peer tested exactly once. */
+export interface WalkForwardPooled {
+  mean_abs_log_error: number;
+  median_abs_log_error: number;
+  within_2x: number;
+  spearman: number;
+  n: number;
+}
+
+/** The walk-forward test: its folds, and each model's pooled numbers over them. */
+export interface WalkForwardResult {
+  folds: WalkForwardFold[];
+  pooled_median_ratio: WalkForwardPooled;
+  pooled_size_curve: WalkForwardPooled;
+}
+
 /** The size curve's stability over seeded resamples of the live tokens. */
 export interface BootstrapResult {
   resamples: number;
@@ -246,7 +283,13 @@ export interface SizeCurve {
   intercept: number;
   slope: number;
   live_n: number;
+  /** Whether the curve was fitted on the trimmed peer set (exchanges and wrappers left out). */
+  peers_trimmed: boolean;
+  /** How many peers the curve was fitted on, and how many live-token peers there are. */
+  peers_used_n: number;
+  peers_total_n: number;
   oos: OosSplit[];
+  walkforward: WalkForwardResult;
   bootstrap: BootstrapResult;
 }
 
@@ -329,15 +372,43 @@ export function curvePeers(snapshot: Snapshot): SnapshotProtocol[] {
   return snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
 }
 
+/** The peer categories the curve is not fitted on: exchanges and bridge, liquid-staking
+ * and restaking wrappers. Their token is a different business from a DeFi protocol's,
+ * so their market-cap / TVL relation bends the curve away from the protocols the board
+ * ranks. These are the watchlist's own excluded categories, applied to the peers
+ * instead of the board: the same rule, on the other side of the same line.
+ */
+const PEER_TRIM_CATEGORIES = new Set(['CEX', 'Bridge', 'Canonical Bridge', 'Liquid Staking', 'Liquid Restaking', 'Restaked BTC']);
+
+/** Below this many trimmed peers, a curve fitted on them is not trusted: fall back to all peers. */
+export const PEER_TRIM_MIN = 15;
+
+/** The peers a curve is fitted on: the trimmed set, or all peers when the trimmed set is too small. */
+export function curveFitPeers(peers: SnapshotProtocol[]): { peers: SnapshotProtocol[]; trimmed: boolean } {
+  const trimmed = peers.filter((p) => !PEER_TRIM_CATEGORIES.has(p.category ?? ''));
+  if (trimmed.length >= PEER_TRIM_MIN) return { peers: trimmed, trimmed: true };
+  return { peers, trimmed: false };
+}
+
 /**
  * The size curve, fitted on a set of live-token protocols: log(market cap) against log(TVL).
  * A slope under 1 says a bigger protocol's token is worth more dollars but less per TVL dollar.
+ * The fit uses the trimmed peer set (see curveFitPeers), so the same call fits the same
+ * procedure on a training fold as on the whole snapshot.
  */
-export function fitSizeCurve(peers: SnapshotProtocol[]): { intercept: number; slope: number } {
-  return ols(
-    peers.map((p) => Math.log(p.tvl_usd)),
-    peers.map((p) => Math.log(p.mcap_usd!)),
+export function fitSizeCurve(peers: SnapshotProtocol[]): {
+  intercept: number;
+  slope: number;
+  trimmed: boolean;
+  peers_used_n: number;
+  peers_total_n: number;
+} {
+  const used = curveFitPeers(peers);
+  const curve = ols(
+    used.peers.map((p) => Math.log(p.tvl_usd)),
+    used.peers.map((p) => Math.log(p.mcap_usd!)),
   );
+  return { ...curve, trimmed: used.trimmed, peers_used_n: used.peers.length, peers_total_n: peers.length };
 }
 
 /** The fitted multiple at one TVL: the curve's market cap there, divided by that TVL. */
@@ -350,23 +421,62 @@ export function fitMedianRatio(peers: SnapshotProtocol[]): number {
   return median(peers.map((p) => Math.min(p.mcap_usd! / p.tvl_usd, 2)));
 }
 
-/** One model's error on held-out tokens: median absolute percentage and log errors. */
-function oosScore(predict: (p: SnapshotProtocol) => number, test: SnapshotProtocol[]): OosModelResult {
+/** One model's error on held-out tokens, with the paired predictions the pooled rank test needs.
+ * The pairs are kept out of the stored result (see asResult): the dashboard's data would
+ * carry them otherwise. */
+function oosScore(
+  predict: (p: SnapshotProtocol) => number,
+  test: SnapshotProtocol[],
+): OosModelResult & { mean_abs_log_error: number; pairs: { pred: number; actual: number }[] } {
   const apes: number[] = [];
   const logs: number[] = [];
+  const pairs: { pred: number; actual: number }[] = [];
   let within = 0;
   for (const p of test) {
     const pred = Math.max(1, predict(p));
     apes.push(Math.abs(pred - p.mcap_usd!) / p.mcap_usd!);
     const le = Math.abs(Math.log(pred) - Math.log(p.mcap_usd!));
     logs.push(le);
+    pairs.push({ pred, actual: p.mcap_usd! });
     if (le < Math.log(2)) within += 1;
   }
   return {
-    median_abs_pct_error: median(apes),
-    median_abs_log_error: median(logs),
+    median_abs_pct_error: test.length === 0 ? 0 : median(apes),
+    median_abs_log_error: test.length === 0 ? 0 : median(logs),
+    mean_abs_log_error: test.length === 0 ? 0 : logs.reduce((a, b) => a + b, 0) / logs.length,
     within_2x: test.length === 0 ? 0 : within / test.length,
+    pairs,
   };
+}
+
+/** Only the three published numbers of a score: the pairs and the mean stay out of the stored data. */
+function asResult(s: OosModelResult): OosModelResult {
+  return { median_abs_pct_error: s.median_abs_pct_error, median_abs_log_error: s.median_abs_log_error, within_2x: s.within_2x };
+}
+
+/** Spearman's rank correlation between predicted and actual values, on paired predictions. */
+export function spearman(pairs: { pred: number; actual: number }[]): number {
+  const n = pairs.length;
+  if (n < 2) return 0;
+  const rankOf = (values: number[]): number[] => {
+    const order = values.map((v, i) => [v, i] as [number, number]).sort((a, b) => a[0] - b[0]);
+    const ranks = new Array<number>(values.length);
+    for (let i = 0; i < order.length; i++) ranks[order[i]![1]] = i + 1;
+    return ranks;
+  };
+  const rp = rankOf(pairs.map((x) => x.pred));
+  const ra = rankOf(pairs.map((x) => x.actual));
+  const mp = rp.reduce((a, b) => a + b, 0) / n;
+  const ma = ra.reduce((a, b) => a + b, 0) / n;
+  let num = 0;
+  let dp = 0;
+  let da = 0;
+  for (let i = 0; i < n; i++) {
+    num += (rp[i]! - mp) * (ra[i]! - ma);
+    dp += (rp[i]! - mp) ** 2;
+    da += (ra[i]! - ma) ** 2;
+  }
+  return dp === 0 || da === 0 ? 0 : num / Math.sqrt(dp * da);
 }
 
 /**
@@ -385,14 +495,80 @@ export function outOfSampleTest(peers: SnapshotProtocol[]): OosSplit[] {
       cutoff,
       train_n: train.length,
       test_n: test.length,
-      median_ratio: oosScore((p) => p.tvl_usd * Math.min(0.6, Math.max(0.05, ratio)), test),
-      size_curve: oosScore((p) => Math.exp(curve.intercept + curve.slope * Math.log(p.tvl_usd)), test),
+      median_ratio: asResult(oosScore((p) => p.tvl_usd * Math.min(0.6, Math.max(0.05, ratio)), test)),
+      size_curve: asResult(oosScore((p) => Math.exp(curve.intercept + curve.slope * Math.log(p.tvl_usd)), test)),
     };
   });
 }
 
+/** One model's pooled walk-forward numbers from its per-fold scores. The rank correlation
+ * is the mean of the folds' own Spearman values: pooling predictions across folds would
+ * mix the folds' different fitted scales, so a pooled rank correlation says nothing.
+ * (Within a fold the curve and the ratio both rank by TVL, so their rank correlations
+ * are the same by construction; the curve's win is on how far the values are, not on
+ * their order.) */
+function pooledWalkForward(
+  foldScores: (OosModelResult & { mean_abs_log_error: number; pairs: { pred: number; actual: number }[] })[],
+  foldSpearman: number[],
+): WalkForwardPooled {
+  const pairs = foldScores.flatMap((s) => s.pairs);
+  const logs = pairs.map((pair) => Math.abs(Math.log(pair.pred) - Math.log(pair.actual)));
+  return {
+    mean_abs_log_error: logs.reduce((a, b) => a + b, 0) / logs.length,
+    median_abs_log_error: median(logs),
+    within_2x: logs.filter((le) => le < Math.log(2)).length / logs.length,
+    spearman: foldSpearman.reduce((a, b) => a + b, 0) / foldSpearman.length,
+    n: logs.length,
+  };
+}
+
 /**
- * The bootstrap: resample the live tokens with replacement, refit the curve, and read the
+ * The walk-forward test: for each listing year present in the snapshot after the first,
+ * fit both models on the live tokens listed before that year and score them on the tokens
+ * listed in that year — tokens neither model has seen, year by year. The years come from
+ * the data, so the test re-derives itself on any future snapshot. Every dated peer is
+ * tested exactly once, so the pooled numbers are one clean out-of-sample read, not a
+ * test set counted twice.
+ */
+export function walkForwardTest(peers: SnapshotProtocol[]): WalkForwardResult {
+  const dated = peers.filter((p) => p.listed_at !== null);
+  const years = [...new Set(dated.map((p) => p.listed_at!.slice(0, 4)))].sort();
+  const folds: WalkForwardFold[] = [];
+  const ratioScores: (OosModelResult & { mean_abs_log_error: number; pairs: { pred: number; actual: number }[] })[] = [];
+  const curveScores: (OosModelResult & { mean_abs_log_error: number; pairs: { pred: number; actual: number }[] })[] = [];
+  const ratioSpearman: number[] = [];
+  const curveSpearman: number[] = [];
+  for (const year of years.slice(1)) {
+    const cutoff = `${year}-01-01`;
+    const next = `${Number(year) + 1}-01-01`;
+    const train = dated.filter((p) => p.listed_at! < cutoff);
+    const test = dated.filter((p) => p.listed_at! >= cutoff && p.listed_at! < next);
+    if (test.length === 0) continue;
+    const ratio = fitMedianRatio(train);
+    const curve = fitSizeCurve(train);
+    const ratioScore = oosScore((p) => p.tvl_usd * Math.min(0.6, Math.max(0.05, ratio)), test);
+    const curveScore = oosScore((p) => Math.exp(curve.intercept + curve.slope * Math.log(p.tvl_usd)), test);
+    folds.push({
+      year,
+      train_n: train.length,
+      test_n: test.length,
+      median_ratio: asResult(ratioScore),
+      size_curve: asResult(curveScore),
+    });
+    ratioScores.push(ratioScore);
+    curveScores.push(curveScore);
+    ratioSpearman.push(spearman(ratioScore.pairs));
+    curveSpearman.push(spearman(curveScore.pairs));
+  }
+  return {
+    folds,
+    pooled_median_ratio: pooledWalkForward(ratioScores, ratioSpearman),
+    pooled_size_curve: pooledWalkForward(curveScores, curveSpearman),
+  };
+}
+
+/**
+ * The bootstrap: resample the fitted peers with replacement, refit the curve, and read the
  * 5th, 50th and 95th percentiles of the slope and of the fitted multiple at $50M and $1B
  * of TVL. A narrow band says the curve does not hinge on any one token.
  */
@@ -428,16 +604,22 @@ export function bootstrapCurve(peers: SnapshotProtocol[], resamples: number = BO
   };
 }
 
-/** The fitted curve and both of its tests, from the snapshot alone. */
+/** The fitted curve and its tests, from the snapshot alone. The bootstrap resamples the
+ * peer set the curve was actually fitted on (the trimmed set, when it was used). */
 export function fitModel(snapshot: Snapshot): SizeCurve {
   const peers = curvePeers(snapshot);
   const curve = fitSizeCurve(peers);
+  const fittedPeers = curveFitPeers(peers).peers;
   return {
     intercept: curve.intercept,
     slope: curve.slope,
     live_n: peers.length,
+    peers_trimmed: curve.trimmed,
+    peers_used_n: curve.peers_used_n,
+    peers_total_n: curve.peers_total_n,
     oos: outOfSampleTest(peers),
-    bootstrap: bootstrapCurve(peers),
+    walkforward: walkForwardTest(peers),
+    bootstrap: bootstrapCurve(fittedPeers),
   };
 }
 

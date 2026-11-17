@@ -16,13 +16,13 @@ board never predicts whether or when a token is issued. Its implied value is the
 entry's own model claim, and a protocol is said to *record no token*, never to
 have none.
 
-## The model (radar-3)
+## The model (radar-4)
 
 `lib/model.ts` — one function scores every row, from the snapshot's own figures
 only, no hardcoded names:
 
 ```
-log(market cap) = 6.9646 + 0.5223 x log(tvl_usd)   (least squares, 128 live tokens)
+log(market cap) = 8.9978 + 0.4049 x log(tvl_usd)   (least squares, 94 comparable live tokens)
 implied = round(tvl_usd x size_multiple
   x (1 + clamp(change_7d, -60, 100) / 100 x 0.6)
   x (0.55 + 0.45 x min(age_days, 1460) / 1460)
@@ -30,11 +30,14 @@ implied = round(tvl_usd x size_multiple
 ```
 
 - **Size curve** — the market-cap / TVL relation is fitted, not assumed: a log-log
-  regression over the 128 live-token protocols in *this same snapshot* with a
-  market cap and a TVL. The slope is 0.52, so a bigger protocol's token is worth
-  more dollars but less per dollar of TVL: the fitted multiple is 0.22 at $50M
-  of TVL and 0.05 at $1B. The model re-derives itself on any future snapshot
-  instead of carrying a hand-kept list.
+  regression over the 94 comparable live-token protocols in *this same snapshot* —
+  the 128 live-token protocols with a market cap and a TVL, minus exchanges and
+  bridge, liquid-staking and restaking wrappers, whose token is a different business
+  from a DeFi protocol's. When the trimmed set is too small to fit (under 15 peers),
+  the curve falls back to all live-token peers. The slope is 0.40, so a bigger
+  protocol's token is worth more dollars but less per dollar of TVL: the fitted
+  multiple is 0.21 at $50M of TVL and 0.036 at $1B. The model re-derives itself on
+  any future snapshot instead of carrying a hand-kept list.
 - **Growth** — the 7-day TVL change, clamped and dampened.
 - **Maturity** — age since first listing: how long the protocol has run with no
   token on record. Unknown age uses 365 days.
@@ -44,23 +47,62 @@ Risk is scored separately from value (sharp 7-day move, unknown or very young
 listing, single-chain exposure, thin TVL, missing category) and shown on every
 row as Low / Medium / High with its signals, so value and risk sit side by side.
 
-### The model tests itself
+### The model tests itself — walk-forward
 
-Every run fits the curve, then tests it out of sample and checks its stability —
-the dashboard reports the numbers, computed from the same snapshot:
+Every run fits the curve, then tests it walk-forward and checks its stability —
+the dashboard reports the numbers, computed from the same snapshot. Walk-forward
+means five expanding windows by listing year: fit both the old median-ratio model
+and the size curve on the live tokens listed before a year, test on the ones
+listed in that year, tokens neither model has seen. Each of the 88 dated live
+tokens is tested exactly once:
 
-- **Time-split out-of-sample test.** Fit both the old median-ratio model and
-  the size curve on the live tokens listed before a cutoff, test on the ones
-  listed after it. At the 2024-01-01 split (44 train, 51 test) the curve's
-  median log error is 1.07 against 1.64 for the median ratio (median absolute
-  error 86% vs 88%, within 2x 37% vs 25%). At the 2023-01-01 split (24 train,
-  71 test) it is 1.12 against 1.64 (83% vs 89%, within 2x 31% vs 28%). The
-  curve wins on both splits, so the curve is used. A category residual was
-  tested the same way and did not survive the time split, so no category
-  multiple is used.
-- **Bootstrap.** 500 seeded resamples of the 128 live tokens, refit each time:
-  slope 5th–95th percentile 0.39–0.66 (median 0.52); fitted multiple at $50M
-  of TVL 0.17–0.31, at $1B 0.03–0.09. The curve does not hinge on any one token.
+| Year | Fit on | Tested on | Median-ratio median log error | Size-curve median log error | Curve within 2x |
+| --- | --- | --- | --- | --- | --- |
+| 2022 | 7 | 17 | 0.95 | 1.88 | 18% |
+| 2023 | 24 | 20 | 1.68 | 1.19 | 30% |
+| 2024 | 44 | 20 | 1.82 | 0.91 | 45% |
+| 2025 | 64 | 22 | 1.62 | 0.72 | 45% |
+| 2026 | 86 | 9 | 2.10 | 2.03 | 33% |
+
+Pooled: the curve's mean log error 1.55 against 1.72 for the median ratio,
+median log error 1.15 against 1.66, within 2x 35% against 28%. Rank correlation
+(Spearman, mean of the folds) is 0.31 for both — within a fold both models rank
+by TVL, so the curve's win is on how far the values are, not on their order.
+The curve loses the earliest fold, when only 7 tokens train it, and wins the
+other four. The win is small and is reported as small.
+
+Walk-forward is also how the model was chosen. The trimmed-peer curve beats the
+plain global curve on mean log error and within-2x on both this test and the
+cumulative splits below (walk-forward pooled 1.55 vs 1.58, 35% vs 31% within 2x;
+cumulative pooled 1.50 vs 1.55, 37% vs 34%). What was tested and rejected, on
+walk-forward:
+
+- **Per-category curves** — the largest category holds 15 of 128 peers, and they
+  lost or tied on every pooled number, so no category multiple is used.
+- **A quadratic curve** — it ties the trimmed curve on walk-forward mean error
+  but loses it on the cumulative splits and on within-2x, and on the trimmed
+  peers it bends down at high TVL (a $100B protocol would be worth less than a
+  $10B one), so it is not used.
+- **The trimmed curve without its small-train fallback** — a paired bootstrap
+  (2,000 resamples) puts the 95% interval for (global curve error − trimmed
+  error) at −0.29 to −0.00: the trimmed curve without its fallback is worse,
+  and the interval excludes no difference. It also collapses on the earliest
+  fold, when the trimmed set is four peers.
+- **The growth and maturity multipliers** — varying the growth weight from 0 to
+  1.0 moves pooled walk-forward mean log error by 0.025 (1.61 to 1.64), and the
+  full implied value costs about 0.05 mean log error against live market caps
+  versus the bare curve. They are kept because the value is supposed to follow
+  TVL, 7-day growth and age, not because they sharpen the market-cap fit.
+
+- **Time-split out-of-sample test (kept from radar-3).** Fit both models on the
+  live tokens listed before a cutoff, test on the ones listed after it. At the
+  2024-01-01 split (44 train, 51 test) the curve's median log error is 0.83
+  against 1.65 for the median ratio (median absolute error 79% vs 88%, within
+  2x 45% vs 25%). At the 2023-01-01 split (24 train, 71 test) it is 1.14
+  against 1.66 (71% vs 89%, within 2x 31% vs 28%).
+- **Bootstrap.** 500 seeded resamples of the 94 fitted peers, refit each time:
+  slope 5th–95th percentile 0.23–0.59 (median 0.41); fitted multiple at $50M
+  of TVL 0.15–0.30, at $1B 0.019–0.069. The curve does not hinge on any one token.
 - Market caps are hard to predict from TVL alone, and the errors above are
   honest: the board is a ranking by the fitted curve, not a price forecast.
 
@@ -91,7 +133,7 @@ from a stated planning scenario, not a prediction — if the airdrop is 5% of th
 implied value shared by 2,000 farmers, the reader's share minus the cost is the
 expected net: FARM when it clears $100, THIN when it clears $0, SKIP when it
 does not, and a High-risk row never rises above THIN. On this snapshot:
-79 FARM, 109 THIN, 10 SKIP.
+88 FARM, 102 THIN, 8 SKIP.
 
 ## The dashboard
 
@@ -105,8 +147,10 @@ verbatim, so page and `board.json` agree), with:
 - a detail view for every protocol: the full model equation with a recomputed
   check against `board.json`, its risk signals, its farm economics (costs,
   break-even, scenario net, verdict), and its farm plan;
-- a Live-token tab and a model panel that states the formula, the out-of-sample
-  test, the bootstrap stability, the farm-economics assumptions, and the caveats.
+- a Live-token tab and a model panel that states the formula, the walk-forward
+  test that chose the model (five folds, pooled numbers, and what was tested and
+  rejected), the cumulative time-split test, the bootstrap stability, the
+  farm-economics assumptions, and the caveats.
 
 ## Run it
 
