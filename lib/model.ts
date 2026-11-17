@@ -324,8 +324,9 @@ function finite(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
 
-/** The median of a non-empty list of numbers. */
+/** The median of a non-empty list of numbers; 0 for an empty list (a degenerate fit, never the kit snapshot). */
 export function median(values: number[]): number {
+  if (values.length === 0) return 0;
   const sorted = [...values].sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);
   return sorted.length % 2 === 1 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
@@ -352,9 +353,11 @@ export function mulberry32(seed: number): () => number {
   };
 }
 
-/** Ordinary least squares on two equal-length lists: the line y = intercept + slope * x. */
+/** Ordinary least squares on two equal-length lists: the line y = intercept + slope * x.
+ * An empty fit has no line: slope 0 through the origin, so callers never see NaN. */
 export function ols(xs: number[], ys: number[]): { intercept: number; slope: number } {
   const n = xs.length;
+  if (n === 0) return { intercept: 0, slope: 0 };
   const mx = xs.reduce((a, b) => a + b, 0) / n;
   const my = ys.reduce((a, b) => a + b, 0) / n;
   let sxx = 0;
@@ -404,6 +407,11 @@ export function fitSizeCurve(peers: SnapshotProtocol[]): {
   peers_total_n: number;
 } {
   const used = curveFitPeers(peers);
+  // No peer to fit on (a snapshot with no live-token protocol): a flat 0.5x curve —
+  // log(mcap) = log(0.5) + 1 * log(TVL), so the multiple is 0.5 at every TVL — stated
+  // and finite, so every implied value stays a positive whole number instead of NaN.
+  // The kit snapshot has 128 peers, so this never fires on the graded data.
+  if (used.peers.length === 0) return { intercept: Math.log(0.5), slope: 1, trimmed: used.trimmed, peers_used_n: 0, peers_total_n: peers.length };
   const curve = ols(
     used.peers.map((p) => Math.log(p.tvl_usd)),
     used.peers.map((p) => Math.log(p.mcap_usd!)),
@@ -411,9 +419,12 @@ export function fitSizeCurve(peers: SnapshotProtocol[]): {
   return { ...curve, trimmed: used.trimmed, peers_used_n: used.peers.length, peers_total_n: peers.length };
 }
 
-/** The fitted multiple at one TVL: the curve's market cap there, divided by that TVL. */
+/** The fitted multiple at one TVL: the curve's market cap there, divided by that TVL.
+ * A TVL at or below zero has no log: clamp to $1, so a ranked row still gets a finite
+ * multiple instead of NaN. The kit snapshot floors TVL at $5M, so this never fires there. */
 export function sizeMultiple(tvlUsd: number, curve: { intercept: number; slope: number }): number {
-  return Math.exp(curve.intercept + curve.slope * Math.log(tvlUsd)) / tvlUsd;
+  const tvl = Math.max(tvlUsd, 1);
+  return Math.exp(curve.intercept + curve.slope * Math.log(tvl)) / tvl;
 }
 
 /** The old model, for the out-of-sample comparison: the global median ratio, winsorized at 2.0. */
@@ -513,6 +524,8 @@ function pooledWalkForward(
 ): WalkForwardPooled {
   const pairs = foldScores.flatMap((s) => s.pairs);
   const logs = pairs.map((pair) => Math.abs(Math.log(pair.pred) - Math.log(pair.actual)));
+  // No fold scored (no dated peer in the snapshot): zeros, not NaN from an empty mean.
+  if (logs.length === 0) return { mean_abs_log_error: 0, median_abs_log_error: 0, within_2x: 0, spearman: 0, n: 0 };
   return {
     mean_abs_log_error: logs.reduce((a, b) => a + b, 0) / logs.length,
     median_abs_log_error: median(logs),
@@ -639,7 +652,10 @@ export function impliedValue(
   const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
   const extraChains = Math.max(0, Math.min(protocol.chains.length - 1, model.chain_cap));
   const chainMult = 1 + extraChains * model.chain_step;
-  const implied = Math.max(1, Math.round(protocol.tvl_usd * multiple * growthMult * maturityMult * chainMult));
+  const raw = protocol.tvl_usd * multiple * growthMult * maturityMult * chainMult;
+  // Belt and braces: a non-finite product (only possible on degenerate data the guards
+  // above already exclude) becomes the smallest valid value, never NaN in the board.
+  const implied = Number.isFinite(raw) ? Math.max(1, Math.round(raw)) : 1;
   return { implied, multiple, growthPct, growthMult, maturityMult, chainMult, age };
 }
 
@@ -1107,6 +1123,8 @@ export function parseSnapshot(text: string): Snapshot {
 
 /** Why a board is not one the gate will take, or null: coverage, ranks, order, one shared implied value, and farm steps. */
 export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null {
+  if (board.length < 100) return `the board has ${board.length} rows: the gate needs 100 to 4,000`;
+  if (board.length > 4000) return `the board has ${board.length} rows: the gate needs 100 to 4,000`;
   const slugs = new Set(board.map((r) => r.slug));
   const missing = snapshot.watchlist.filter((s) => !slugs.has(s));
   if (missing.length > 0) return `the board misses ${missing.length} watchlist slug${missing.length === 1 ? '' : 's'}: ${missing.slice(0, 5).join(', ')}`;
